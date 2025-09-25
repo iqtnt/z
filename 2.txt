@@ -1,0 +1,113 @@
+from flask import Flask, request
+from flask_socketio import SocketIO, emit
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'secret!'
+# استخدم threading لتجنب مشاكل Windows
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+
+# خريطة للحفاظ على peer_id -> sid
+peers = {}
+sid_to_peer = {}
+
+# HTML مدمج
+html = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>LAN Audio Call</title>
+</head>
+<body>
+<h2>LAN Call (Audio)</h2>
+<div>Your ID: <span id="myId"></span></div>
+<div id="peers"></div>
+<audio id="remoteAudio" autoplay></audio>
+
+<script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+<script>
+const socket = io({transports:['websocket']});
+const myId = Math.random().toString(36).substr(2,9);
+document.getElementById('myId').textContent = myId;
+
+let pc;
+
+socket.on('connect', () => { socket.emit('register', {id: myId}); });
+
+socket.on('peers', ids => {
+    const div = document.getElementById('peers');
+    div.innerHTML = '';
+    ids.filter(x => x !== myId).forEach(id => {
+        const btn = document.createElement('button');
+        btn.textContent = "Call " + id;
+        btn.onclick = () => startCall(id);
+        div.appendChild(btn);
+        div.appendChild(document.createElement('br'));
+    });
+});
+
+socket.on('signal', async data => {
+    if (data.to !== myId) return;
+    if (!pc) await setupPC(data.from);
+
+    if (data.sdp){
+        await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+        if (data.sdp.type === "offer"){
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socket.emit("signal", {from: myId, to: data.from, sdp: pc.localDescription});
+        }
+    } else if (data.candidate){
+        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+    }
+});
+
+async function setupPC(remoteId){
+    pc = new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});
+    pc.ontrack = e => document.getElementById("remoteAudio").srcObject = e.streams[0];
+    pc.onicecandidate = e => {
+        if(e.candidate) socket.emit("signal", {from: myId, to: remoteId, candidate: e.candidate});
+    };
+    const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    stream.getTracks().forEach(t => pc.addTrack(t, stream));
+}
+
+async function startCall(remoteId){
+    await setupPC(remoteId);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    socket.emit("signal", {from: myId, to: remoteId, sdp: pc.localDescription});
+}
+</script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return html
+
+@socketio.on('register')
+def handle_register(data):
+    peer_id = data.get('id')
+    sid = request.sid
+    peers[peer_id] = sid
+    sid_to_peer[sid] = peer_id
+    socketio.emit('peers', list(peers.keys()))
+
+@socketio.on('signal')
+def handle_signal(data):
+    to = data.get('to')
+    if to in peers:
+        socketio.emit('signal', data, room=peers[to])
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    sid = request.sid
+    peer_id = sid_to_peer.pop(sid, None)
+    if peer_id:
+        peers.pop(peer_id, None)
+    socketio.emit('peers', list(peers.keys()))
+
+if __name__ == '__main__':
+    print("Starting server on 0.0.0.0:5000")
+    socketio.run(app, host="0.0.0.0", port=5000, debug=True)
