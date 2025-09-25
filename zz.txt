@@ -1,0 +1,183 @@
+# lan_webrtc_call.py
+from flask import Flask, request
+from flask_socketio import SocketIO
+import eventlet
+eventlet.monkey_patch()
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'secret!'
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# خريطة للحفاظ على peer_id -> socket sid
+peers = {}
+sid_to_peer = {}
+
+html = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LAN WebRTC Call (audio)</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;padding:16px}
+    #peers button{margin-left:8px}
+    #log{white-space:pre-wrap;background:#f4f4f4;padding:8px;border-radius:6px;max-height:200px;overflow:auto}
+  </style>
+</head>
+<body>
+  <h3>LAN Call (audio)</h3>
+  <div>Your ID: <span id="myId"></span></div>
+  <div id="peersArea">
+    <h4>Peers on network:</h4>
+    <div id="peers">-- no peers --</div>
+  </div>
+  <div style="margin-top:10px;">
+    <audio id="remoteAudio" autoplay></audio>
+  </div>
+  <h4>Debug / Console</h4>
+  <div id="log"></div>
+
+  <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+  <script>
+    const logEl = document.getElementById('log');
+    function log(s){ console.log(s); logEl.textContent += s + "\\n"; logEl.scrollTop = logEl.scrollHeight; }
+
+    const socket = io({transports:['websocket']});
+    const myId = Math.random().toString(36).substr(2,9);
+    document.getElementById('myId').textContent = myId;
+
+    let pc = null;
+    let localStream = null;
+
+    socket.on('connect', () => {
+      log('socket connected: ' + socket.id);
+      socket.emit('register', {id: myId});
+    });
+
+    socket.on('peers', data => {
+      log('peers list: ' + JSON.stringify(data));
+      const peersDiv = document.getElementById('peers');
+      peersDiv.innerHTML = '';
+      const others = data.filter(id => id !== myId);
+      if(others.length === 0){ peersDiv.innerText = '-- no peers --'; return; }
+      others.forEach(id => {
+        const line = document.createElement('div');
+        line.textContent = id;
+        const btn = document.createElement('button');
+        btn.textContent = 'Call';
+        btn.onclick = () => startCall(id);
+        line.appendChild(btn);
+        peersDiv.appendChild(line);
+      });
+    });
+
+    socket.on('signal', async data => {
+      log('signal recv: ' + JSON.stringify(Object.assign({}, data, {sdp: data.sdp ? data.sdp.type : undefined})));
+      if(data.to !== myId) return; // مش موجه إلي
+      // لو ما في pc، أنشئ واحد
+      if(!pc) await preparePeerConnection(data.from);
+
+      if(data.sdp){
+        const desc = new RTCSessionDescription(data.sdp);
+        await pc.setRemoteDescription(desc);
+        log('setRemoteDescription: ' + data.sdp.type);
+        if(data.sdp.type === 'offer'){
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          socket.emit('signal', { from: myId, to: data.from, sdp: pc.localDescription });
+          log('sent answer');
+        }
+      } else if(data.candidate){
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+          log('added ICE candidate');
+        } catch(e){
+          log('addIceCandidate error: ' + e);
+        }
+      }
+    });
+
+    async function preparePeerConnection(remoteId){
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+      });
+
+      pc.ontrack = e => {
+        log('ontrack');
+        document.getElementById('remoteAudio').srcObject = e.streams[0];
+      };
+
+      pc.onicecandidate = e => {
+        if(e.candidate){
+          socket.emit('signal', { from: myId, to: remoteId, candidate: e.candidate });
+          log('sent candidate');
+        }
+      };
+
+      // احصل على المايك (قد يُرفض إذا الصفحة غير امنة)
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+        log('got local audio');
+      } catch(err){
+        log('getUserMedia failed: ' + err);
+        throw err;
+      }
+    }
+
+    async function startCall(remoteId){
+      try {
+        await preparePeerConnection(remoteId);
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.emit('signal', { from: myId, to: remoteId, sdp: pc.localDescription });
+        log('sent offer');
+      } catch(e){
+        log('startCall error: ' + e);
+      }
+    }
+  </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return html
+
+@socketio.on('register')
+def handle_register(data):
+    peer_id = data.get('id')
+    if not peer_id:
+        return
+    print("register:", peer_id, "sid:", request.sid)
+    peers[peer_id] = request.sid
+    sid_to_peer[request.sid] = peer_id
+    # أرسل قائمة peers للجميع
+    socketio.emit('peers', list(peers.keys()))
+
+@socketio.on('signal')
+def handle_signal(data):
+    to = data.get('to')
+    if not to:
+        print("signal missing 'to'")
+        return
+    target_sid = peers.get(to)
+    if target_sid:
+        socketio.emit('signal', data, room=target_sid)
+    else:
+        print("target not found for", to)
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    sid = request.sid
+    peer_id = sid_to_peer.get(sid)
+    if peer_id:
+        print("disconnect:", peer_id)
+        peers.pop(peer_id, None)
+        sid_to_peer.pop(sid, None)
+    socketio.emit('peers', list(peers.keys()))
+
+if __name__ == '__main__':
+    print("Starting on 0.0.0.0:5000")
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
